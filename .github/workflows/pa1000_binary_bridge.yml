@@ -1,4 +1,4 @@
-name: PA1000 VCSL Frame Drum Bridge
+name: PA1000 Commons Riq Mazhar Tabl Bridge
 
 on:
   push:
@@ -9,64 +9,94 @@ permissions:
   contents: read
 
 jobs:
-  fetch-vcsl-frame-drum:
+  fetch-commons-arab-percussion:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch pinned VCSL frame-drum folder only
+      - name: Resolve Commons originals through MediaWiki API and verify bytes
         shell: bash
         run: |
           set -euo pipefail
-          git clone --filter=blob:none --no-checkout https://github.com/sgossner/VCSL.git vcsl
-          cd vcsl
-          git sparse-checkout init --cone
-          git sparse-checkout set 'Membranophones/Struck Membranophones/Frame Drum'
-          git checkout c1ea7bcc3c7309650ab0da9d15c9cd1fbc4a4c7e
-          test "$(git rev-parse HEAD)" = "c1ea7bcc3c7309650ab0da9d15c9cd1fbc4a4c7e"
-
-      - name: Collect exact WAVs and provenance
-        shell: bash
-        run: |
-          set -euo pipefail
-          src='vcsl/Membranophones/Struck Membranophones/Frame Drum'
-          mkdir -p artifact/frame_drum artifact/provenance
-          cp "$src"/*.wav artifact/frame_drum/
-          cp vcsl/LICENSE artifact/provenance/VCSL_LICENSE_CC0.txt
-          printf '%s\n' 'c1ea7bcc3c7309650ab0da9d15c9cd1fbc4a4c7e' > artifact/provenance/SOURCE_COMMIT.txt
-          printf '%s\n' 'Membranophones/Struck Membranophones/Frame Drum' > artifact/provenance/SOURCE_PATH.txt
-          find artifact/frame_drum -maxdepth 1 -type f -name '*.wav' -printf '%f\n' | LC_ALL=C sort > artifact/provenance/FILENAMES.txt
-          test "$(wc -l < artifact/provenance/FILENAMES.txt)" -eq 18
-          : > artifact/provenance/SHA256SUMS.txt
-          : > artifact/provenance/GIT_BLOB_SHA1.txt
-          : > artifact/provenance/SIZES.txt
+          mkdir -p artifact/media artifact/provenance
           python3 - <<'PY'
-          import pathlib, wave, hashlib, subprocess
-          root=pathlib.Path('artifact/frame_drum')
-          rows=['filename\tsample_rate\tchannels\tsample_width_bytes\tframes\tduration_s\n']
-          for p in sorted(root.glob('*.wav')):
-              raw=p.read_bytes()
-              if raw[:4] not in (b'RIFF',b'RF64') or raw[8:12] != b'WAVE':
-                  raise SystemExit(f'Not WAV: {p}')
-              try:
-                  with wave.open(str(p),'rb') as w:
-                      sr=w.getframerate(); ch=w.getnchannels(); sw=w.getsampwidth(); n=w.getnframes()
-              except wave.Error as e:
-                  raise SystemExit(f'WAV parse failed {p}: {e}')
-              rows.append(f'{p.name}\t{sr}\t{ch}\t{sw}\t{n}\t{n/sr:.9f}\n')
-          pathlib.Path('artifact/provenance/WAV_METADATA.tsv').write_text(''.join(rows),encoding='utf-8')
-          PY
-          while IFS= read -r name; do
-            file="artifact/frame_drum/$name"
-            rel="Membranophones/Struck Membranophones/Frame Drum/$name"
-            sha256sum "$file" >> artifact/provenance/SHA256SUMS.txt
-            printf '%s  %s\n' "$(git -C vcsl hash-object "$rel")" "$name" >> artifact/provenance/GIT_BLOB_SHA1.txt
-            printf '%s  %s\n' "$(stat -c '%s' "$file")" "$name" >> artifact/provenance/SIZES.txt
-          done < artifact/provenance/FILENAMES.txt
-          cat artifact/provenance/WAV_METADATA.tsv
+          import urllib.parse, urllib.request, json, pathlib, hashlib, html, re
 
-      - name: Upload VCSL Frame Drum artifact
+          titles = [
+              'File:Riq demo2.wav',
+              'File:Mazhar demo.ogg',
+              'File:Davul demo.ogg',
+          ]
+          root = pathlib.Path('artifact')
+          media = root/'media'; prov = root/'provenance'
+
+          def fetch(url):
+              req=urllib.request.Request(url,headers={'User-Agent':'PA1000-source-audit/1.0'})
+              with urllib.request.urlopen(req,timeout=120) as r:
+                  return r.read(), r.geturl()
+
+          chars='0123456789abcdefghijklmnopqrstuvwxyz'
+          def to_base36(n):
+              if n==0:return '0'
+              out=''
+              while n:
+                  n,r=divmod(n,36); out=chars[r]+out
+              return out
+
+          rows=['title\tfilename\tsize\tmime\tapi_sha1_base36\tlocal_sha1_hex\tlocal_sha1_base36\tsha256\tlicense\tartist\tdescription\tsource_url\n']
+          metadata={}
+          for title in titles:
+              qs=urllib.parse.urlencode({
+                  'action':'query','format':'json','formatversion':'2',
+                  'prop':'imageinfo','titles':title,
+                  'iiprop':'url|size|sha1|mime|extmetadata'
+              })
+              api='https://commons.wikimedia.org/w/api.php?'+qs
+              raw,_=fetch(api)
+              obj=json.loads(raw.decode('utf-8'))
+              page=obj['query']['pages'][0]
+              if 'missing' in page:
+                  raise SystemExit(f'Missing Commons title: {title}')
+              ii=page['imageinfo'][0]
+              em=ii.get('extmetadata',{})
+              def emv(k): return html.unescape(re.sub('<[^>]+>',' ',em.get(k,{}).get('value',''))).replace('\t',' ').replace('\n',' ').strip()
+              lic=emv('LicenseShortName') or emv('License')
+              artist=emv('Artist')
+              desc=emv('ImageDescription')
+              # Project policy: derivative-friendly license required.
+              if not (lic.startswith('CC BY-SA 4.0') or lic.startswith('CC BY 4.0') or lic.startswith('CC0')):
+                  raise SystemExit(f'Unexpected/non-approved license for {title}: {lic!r}')
+              data,final=fetch(ii['url'])
+              expected_size=int(ii['size'])
+              if len(data)!=expected_size:
+                  raise SystemExit(f'Size mismatch {title}: {len(data)} != {expected_size}')
+              h1hex=hashlib.sha1(data).hexdigest()
+              h1b36=to_base36(int(h1hex,16)).rjust(31,'0')
+              api_h1=ii['sha1'].lower()
+              if h1b36!=api_h1:
+                  raise SystemExit(f'SHA1 mismatch {title}: {h1b36} != {api_h1}')
+              sha256=hashlib.sha256(data).hexdigest()
+              filename=title.split(':',1)[1]
+              out=media/filename
+              out.write_bytes(data)
+              metadata[title]={
+                  'title':title,'filename':filename,'size':len(data),'mime':ii.get('mime',''),
+                  'api_sha1_base36':api_h1,'local_sha1_hex':h1hex,'local_sha1_base36':h1b36,
+                  'sha256':sha256,'license':lic,'artist':artist,'description':desc,
+                  'source_url':ii['url'],'description_url':ii.get('descriptionurl',''),
+              }
+              rows.append('\t'.join(str(x).replace('\t',' ').replace('\n',' ') for x in [
+                  title,filename,len(data),ii.get('mime',''),api_h1,h1hex,h1b36,sha256,lic,artist,desc,ii['url']
+              ])+'\n')
+          (prov/'COMMONS_ARAB_PERCUSSION_MANIFEST.tsv').write_text(''.join(rows),encoding='utf-8')
+          (prov/'COMMONS_ARAB_PERCUSSION_METADATA.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('Verified',len(metadata),'Commons originals')
+          for v in metadata.values():
+              print(v['filename'],v['size'],v['mime'],v['license'],v['sha256'])
+          PY
+
+      - name: Upload verified Commons Arab percussion originals
         uses: actions/upload-artifact@v4
         with:
-          name: pa1000-vcsl-frame-drum-c1ea7bcc
+          name: pa1000-commons-riq-mazhar-tabl
           path: artifact
           if-no-files-found: error
           retention-days: 7
