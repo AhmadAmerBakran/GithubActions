@@ -1,4 +1,4 @@
-name: PA1000 Bendir FSD50K Probe
+name: PA1000 Freesound Preview Bridge
 
 on:
   push:
@@ -9,89 +9,61 @@ permissions:
   contents: read
 
 jobs:
-  probe-bendir-fsd50k:
+  fetch-freesound-previews:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe official FSD50K metadata and exact Freesound IDs
+      - name: Resolve public Freesound preview URLs and fetch HQ previews
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifact/provenance artifact/audio
+          mkdir -p artifact/audio artifact/provenance artifact/raw
           python3 - <<'PY'
-          import json, pathlib, urllib.request, zipfile, hashlib
-
+          import json, pathlib, re, urllib.request, hashlib
+          ids = [140291, 218920, 696751]
           root = pathlib.Path('artifact')
-          prov = root / 'provenance'
-          audio = root / 'audio'
-          base = 'https://zenodo.org/records/4060432/files/'
-          for fn in ['FSD50K.ground_truth.zip', 'FSD50K.metadata.zip']:
-              url = base + fn + '?download=1'
+          rows = ['id\tapi_status\tname\tlicense\thq_ogg\thq_mp3\tfetched\tsize\tsha256\n']
+
+          def fetch(url):
               req = urllib.request.Request(url, headers={'User-Agent':'PA1000-source-audit/1.0'})
-              with urllib.request.urlopen(req, timeout=120) as r:
-                  data = r.read()
-              (root/fn).write_bytes(data)
-              with zipfile.ZipFile(root/fn) as z:
-                  z.extractall(root)
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  return r.read(), r.geturl(), getattr(r, 'status', 200)
 
-          ids = ['140291','218920']
-          lines = ['freesound_id\tsplit\tground_truth_row\tmetadata_found\tlicense\ttitle\tuploader\n']
-          split_map = {}
-          for split, csv_path in [
-              ('dev', root/'FSD50K.ground_truth'/'dev.csv'),
-              ('eval', root/'FSD50K.ground_truth'/'eval.csv')]:
-              rows = csv_path.read_text(encoding='utf-8').splitlines()
-              for fsid in ids:
-                  hit = next((r for r in rows[1:] if r.split(',',1)[0] == fsid), None)
-                  if hit:
-                      split_map[fsid] = split
-          meta_maps = {}
-          for split in ['dev','eval']:
-              p = root/'FSD50K.metadata'/f'{split}_clips_info_FSD50K.json'
-              meta_maps[split] = json.loads(p.read_text(encoding='utf-8'))
           for fsid in ids:
-              split = split_map.get(fsid, 'NOT_INCLUDED')
-              row = ''
-              if split != 'NOT_INCLUDED':
-                  csv_path = root/'FSD50K.ground_truth'/f'{split}.csv'
-                  row = next(r for r in csv_path.read_text(encoding='utf-8').splitlines()[1:] if r.split(',',1)[0] == fsid)
-              meta = meta_maps.get(split, {}).get(fsid) if split in meta_maps else None
-              if meta:
-                  lic = str(meta.get('license','')).replace('\t',' ')
-                  title = str(meta.get('title','')).replace('\t',' ')
-                  uploader = str(meta.get('uploader','')).replace('\t',' ')
-                  found = 'YES'
-              else:
-                  lic = title = uploader = ''
-                  found = 'NO'
-              lines.append('\t'.join([fsid, split, row.replace('\t',' '), found, lic, title, uploader])+'\n')
-          (prov/'FSD50K_BENDIR_ID_PROBE.tsv').write_text(''.join(lines), encoding='utf-8')
-
-          # If the clip is present, try fetching only that single file from the public HF mirror.
-          attempts = []
-          for fsid, split in split_map.items():
-              folder = 'FSD50K.dev_audio' if split == 'dev' else 'FSD50K.eval_audio'
-              url = f'https://huggingface.co/datasets/Fhrozen/FSD50k/resolve/main/{folder}/{fsid}.wav?download=true'
-              try:
-                  req = urllib.request.Request(url, headers={'User-Agent':'PA1000-source-audit/1.0'})
-                  with urllib.request.urlopen(req, timeout=120) as r:
-                      data = r.read()
-                  if data[:4] not in (b'RIFF', b'RF64'):
-                      raise RuntimeError(f'not WAV magic: {data[:8]!r}')
-                  out = audio/f'{fsid}_FSD50K.wav'
-                  out.write_bytes(data)
-                  attempts.append(f'{fsid}\t{split}\tSUCCESS\t{len(data)}\t{hashlib.sha256(data).hexdigest()}\t{url}\n')
-              except Exception as e:
-                  attempts.append(f'{fsid}\t{split}\tFAILED\t0\t\t{url}\t{type(e).__name__}: {e}\n')
-          (prov/'HF_SINGLE_FILE_FETCH.tsv').write_text('freesound_id\tsplit\tstatus\tsize\tsha256\turl\terror\n'+''.join(attempts), encoding='utf-8')
+              data = None; info = None; api_status = ''
+              for api_url in [f'https://freesound.org/api/sounds/{fsid}', f'https://freesound.org/api/sounds/{fsid}/']:
+                  try:
+                      raw, final_url, status = fetch(api_url)
+                      (root/'raw'/f'{fsid}_api_response.json').write_bytes(raw)
+                      info = json.loads(raw.decode('utf-8'))
+                      api_status = f'SUCCESS:{status}:{final_url}'
+                      break
+                  except Exception as e:
+                      api_status = f'FAILED:{type(e).__name__}:{e}'
+              hq_ogg = ''; hq_mp3 = ''; name=''; lic=''; fetched='NO'; size='0'; sha=''
+              if info:
+                  name = str(info.get('original_filename') or info.get('name') or '')
+                  lic = str(info.get('license') or '')
+                  hq_ogg = str(info.get('preview-hq-ogg') or info.get('previews',{}).get('preview-hq-ogg') or '')
+                  hq_mp3 = str(info.get('preview-hq-mp3') or info.get('previews',{}).get('preview-hq-mp3') or '')
+                  preview_url = hq_ogg or hq_mp3
+                  if preview_url:
+                      try:
+                          pdata, pfinal, pstatus = fetch(preview_url)
+                          ext = '.ogg' if ('ogg' in preview_url.lower() or pdata[:4] == b'OggS') else '.mp3'
+                          out = root/'audio'/f'{fsid}_hq_preview{ext}'
+                          out.write_bytes(pdata)
+                          fetched='YES'; size=str(len(pdata)); sha=hashlib.sha256(pdata).hexdigest()
+                      except Exception as e:
+                          fetched=f'FAILED:{type(e).__name__}:{e}'
+              rows.append('\t'.join([str(fsid),api_status,name,lic,hq_ogg,hq_mp3,fetched,size,sha])+'\n')
+          (root/'provenance'/'FREESOUND_PREVIEW_BRIDGE.tsv').write_text(''.join(rows), encoding='utf-8')
           PY
+          cat artifact/provenance/FREESOUND_PREVIEW_BRIDGE.tsv
 
-          cat artifact/provenance/FSD50K_BENDIR_ID_PROBE.tsv
-          cat artifact/provenance/HF_SINGLE_FILE_FETCH.tsv
-
-      - name: Upload Bendir probe artifact
+      - name: Upload Freesound preview artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pa1000-bendir-fsd50k-probe
+          name: pa1000-freesound-bendir-previews
           path: artifact
           if-no-files-found: error
           retention-days: 7
