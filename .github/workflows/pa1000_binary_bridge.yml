@@ -1,4 +1,4 @@
-name: PA1000 Commons Binary Bridge
+name: PA1000 Bendir FSD50K Probe
 
 on:
   push:
@@ -9,69 +9,89 @@ permissions:
   contents: read
 
 jobs:
-  fetch-commons-candidates:
+  probe-bendir-fsd50k:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch and verify Wikimedia Commons originals
+      - name: Probe official FSD50K metadata and exact Freesound IDs
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifact/media artifact/provenance
+          mkdir -p artifact/provenance artifact/audio
           python3 - <<'PY'
-          import hashlib
-          import pathlib
-          import urllib.request
+          import json, pathlib, urllib.request, zipfile, hashlib
 
-          items = [
-              {
-                  "name": "Abu_Hawash_Live_in_Izraa.webm",
-                  "url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Abu_Hawash_Live_in_Izraa%27.webm",
-                  "size": 24081580,
-                  "sha1": "439f1c94e5cfa7d89682ed0810e8b713d0b56590",
-                  "license": "CC BY 3.0",
-                  "identity": "Southern Syria electro-mijwiz techno dabke live performance, Izraa, Syria, 2010",
-                  "source_page": "https://commons.wikimedia.org/wiki/File:Abu_Hawash_Live_in_Izraa%27.webm",
-              },
-              {
-                  "name": "Dawoola_and_Zurna_Live.ogg",
-                  "url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Dawoola_and_Zurna_Live.ogg",
-                  "size": 3788368,
-                  "sha1": "8e5396f58b4cfab444ba3109f5071cbdd3886881",
-                  "license": "CC BY-SA 3.0 / GFDL; project will use CC BY-SA 3.0 route",
-                  "identity": "Live Zurna + Dawoola wedding performance; uploader original",
-                  "source_page": "https://commons.wikimedia.org/wiki/File:Dawoola_and_Zurna_Live.ogg",
-              },
-          ]
-
-          media = pathlib.Path("artifact/media")
-          prov = pathlib.Path("artifact/provenance")
-          rows = ["filename\tsize\tsha1\tsha256\tlicense\tidentity\tsource_page\n"]
-          for item in items:
-              req = urllib.request.Request(item["url"], headers={"User-Agent": "PA1000-source-audit/1.0"})
-              with urllib.request.urlopen(req, timeout=90) as r:
+          root = pathlib.Path('artifact')
+          prov = root / 'provenance'
+          audio = root / 'audio'
+          base = 'https://zenodo.org/records/4060432/files/'
+          for fn in ['FSD50K.ground_truth.zip', 'FSD50K.metadata.zip']:
+              url = base + fn + '?download=1'
+              req = urllib.request.Request(url, headers={'User-Agent':'PA1000-source-audit/1.0'})
+              with urllib.request.urlopen(req, timeout=120) as r:
                   data = r.read()
-              got_size = len(data)
-              got_sha1 = hashlib.sha1(data).hexdigest()
-              got_sha256 = hashlib.sha256(data).hexdigest()
-              if got_size != item["size"]:
-                  raise SystemExit(f"size mismatch {item['name']}: {got_size} != {item['size']}")
-              if got_sha1 != item["sha1"]:
-                  raise SystemExit(f"sha1 mismatch {item['name']}: {got_sha1} != {item['sha1']}")
-              (media / item["name"]).write_bytes(data)
-              rows.append("\t".join([
-                  item["name"], str(got_size), got_sha1, got_sha256,
-                  item["license"], item["identity"], item["source_page"],
-              ]) + "\n")
-          (prov / "COMMONS_SOURCE_MANIFEST.tsv").write_text("".join(rows), encoding="utf-8")
+              (root/fn).write_bytes(data)
+              with zipfile.ZipFile(root/fn) as z:
+                  z.extractall(root)
+
+          ids = ['140291','218920']
+          lines = ['freesound_id\tsplit\tground_truth_row\tmetadata_found\tlicense\ttitle\tuploader\n']
+          split_map = {}
+          for split, csv_path in [
+              ('dev', root/'FSD50K.ground_truth'/'dev.csv'),
+              ('eval', root/'FSD50K.ground_truth'/'eval.csv')]:
+              rows = csv_path.read_text(encoding='utf-8').splitlines()
+              for fsid in ids:
+                  hit = next((r for r in rows[1:] if r.split(',',1)[0] == fsid), None)
+                  if hit:
+                      split_map[fsid] = split
+          meta_maps = {}
+          for split in ['dev','eval']:
+              p = root/'FSD50K.metadata'/f'{split}_clips_info_FSD50K.json'
+              meta_maps[split] = json.loads(p.read_text(encoding='utf-8'))
+          for fsid in ids:
+              split = split_map.get(fsid, 'NOT_INCLUDED')
+              row = ''
+              if split != 'NOT_INCLUDED':
+                  csv_path = root/'FSD50K.ground_truth'/f'{split}.csv'
+                  row = next(r for r in csv_path.read_text(encoding='utf-8').splitlines()[1:] if r.split(',',1)[0] == fsid)
+              meta = meta_maps.get(split, {}).get(fsid) if split in meta_maps else None
+              if meta:
+                  lic = str(meta.get('license','')).replace('\t',' ')
+                  title = str(meta.get('title','')).replace('\t',' ')
+                  uploader = str(meta.get('uploader','')).replace('\t',' ')
+                  found = 'YES'
+              else:
+                  lic = title = uploader = ''
+                  found = 'NO'
+              lines.append('\t'.join([fsid, split, row.replace('\t',' '), found, lic, title, uploader])+'\n')
+          (prov/'FSD50K_BENDIR_ID_PROBE.tsv').write_text(''.join(lines), encoding='utf-8')
+
+          # If the clip is present, try fetching only that single file from the public HF mirror.
+          attempts = []
+          for fsid, split in split_map.items():
+              folder = 'FSD50K.dev_audio' if split == 'dev' else 'FSD50K.eval_audio'
+              url = f'https://huggingface.co/datasets/Fhrozen/FSD50k/resolve/main/{folder}/{fsid}.wav?download=true'
+              try:
+                  req = urllib.request.Request(url, headers={'User-Agent':'PA1000-source-audit/1.0'})
+                  with urllib.request.urlopen(req, timeout=120) as r:
+                      data = r.read()
+                  if data[:4] not in (b'RIFF', b'RF64'):
+                      raise RuntimeError(f'not WAV magic: {data[:8]!r}')
+                  out = audio/f'{fsid}_FSD50K.wav'
+                  out.write_bytes(data)
+                  attempts.append(f'{fsid}\t{split}\tSUCCESS\t{len(data)}\t{hashlib.sha256(data).hexdigest()}\t{url}\n')
+              except Exception as e:
+                  attempts.append(f'{fsid}\t{split}\tFAILED\t0\t\t{url}\t{type(e).__name__}: {e}\n')
+          (prov/'HF_SINGLE_FILE_FETCH.tsv').write_text('freesound_id\tsplit\tstatus\tsize\tsha256\turl\terror\n'+''.join(attempts), encoding='utf-8')
           PY
 
-          test "$(find artifact/media -maxdepth 1 -type f | wc -l)" -eq 2
-          test -s artifact/provenance/COMMONS_SOURCE_MANIFEST.tsv
+          cat artifact/provenance/FSD50K_BENDIR_ID_PROBE.tsv
+          cat artifact/provenance/HF_SINGLE_FILE_FETCH.tsv
 
-      - name: Upload Commons source artifact
+      - name: Upload Bendir probe artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pa1000-commons-source-candidates
+          name: pa1000-bendir-fsd50k-probe
           path: artifact
           if-no-files-found: error
           retention-days: 7
