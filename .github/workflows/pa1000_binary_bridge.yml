@@ -1,0 +1,55 @@
+name: PA1000 FreePats Binary Bridge
+
+on:
+  push:
+    branches:
+      - pa1000-binary-bridge
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-pinned-darbuka:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch pinned FreePats repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/freepats/world-percussion.git freepats
+          cd freepats
+          git checkout e54eb2912a0d6d4444ab205d52f778e27da0fc96
+          test "$(git rev-parse HEAD)" = "e54eb2912a0d6d4444ab205d52f778e27da0fc96"
+
+      - name: Collect Darbuka sources and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/darbuka artifact/provenance
+          cp freepats/samples/Darbuka/*.flac artifact/darbuka/
+          cp "freepats/WorldPercussion 20200905.sfz" artifact/provenance/
+          printf '%s\n' 'e54eb2912a0d6d4444ab205d52f778e27da0fc96' > artifact/provenance/SOURCE_COMMIT.txt
+          find artifact/darbuka -maxdepth 1 -type f -name '*.flac' -printf '%f\n' | LC_ALL=C sort > artifact/provenance/FILENAMES.txt
+          test "$(wc -l < artifact/provenance/FILENAMES.txt)" -eq 25
+          : > artifact/provenance/SHA256SUMS.txt
+          : > artifact/provenance/GIT_BLOB_SHA1.txt
+          while IFS= read -r name; do
+            sha256sum "artifact/darbuka/$name" >> artifact/provenance/SHA256SUMS.txt
+            printf '%s  %s\n' "$(git -C freepats hash-object "samples/Darbuka/$name")" "$name" >> artifact/provenance/GIT_BLOB_SHA1.txt
+          done < artifact/provenance/FILENAMES.txt
+
+      - name: Validate FLAC files
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r f; do
+            flac -t "$f"
+          done < <(find artifact/darbuka -maxdepth 1 -type f -name '*.flac' | LC_ALL=C sort)
+
+      - name: Upload pinned Darbuka artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pa1000-freepats-darbuka-e54eb291
+          path: artifact
+          if-no-files-found: error
+          retention-days: 7
