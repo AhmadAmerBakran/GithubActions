@@ -33,15 +33,7 @@ jobs:
               with urllib.request.urlopen(req,timeout=120) as r:
                   return r.read(), r.geturl()
 
-          chars='0123456789abcdefghijklmnopqrstuvwxyz'
-          def to_base36(n):
-              if n==0:return '0'
-              out=''
-              while n:
-                  n,r=divmod(n,36); out=chars[r]+out
-              return out
-
-          rows=['title\tfilename\tsize\tmime\tapi_sha1_base36\tlocal_sha1_hex\tlocal_sha1_base36\tsha256\tlicense\tartist\tdescription\tsource_url\n']
+          rows=['title\tfilename\tsize\tmime\tapi_sha1_hex\tlocal_sha1_hex\tsha256\tlicense\tartist\tdescription\tsource_url\n']
           metadata={}
           for title in titles:
               qs=urllib.parse.urlencode({
@@ -61,7 +53,6 @@ jobs:
               lic=emv('LicenseShortName') or emv('License')
               artist=emv('Artist')
               desc=emv('ImageDescription')
-              # Project policy: derivative-friendly license required.
               if not (lic.startswith('CC BY-SA 4.0') or lic.startswith('CC BY 4.0') or lic.startswith('CC0')):
                   raise SystemExit(f'Unexpected/non-approved license for {title}: {lic!r}')
               data,final=fetch(ii['url'])
@@ -69,22 +60,21 @@ jobs:
               if len(data)!=expected_size:
                   raise SystemExit(f'Size mismatch {title}: {len(data)} != {expected_size}')
               h1hex=hashlib.sha1(data).hexdigest()
-              h1b36=to_base36(int(h1hex,16)).rjust(31,'0')
               api_h1=ii['sha1'].lower()
-              if h1b36!=api_h1:
-                  raise SystemExit(f'SHA1 mismatch {title}: {h1b36} != {api_h1}')
+              if h1hex!=api_h1:
+                  raise SystemExit(f'SHA1 mismatch {title}: {h1hex} != {api_h1}')
               sha256=hashlib.sha256(data).hexdigest()
               filename=title.split(':',1)[1]
               out=media/filename
               out.write_bytes(data)
               metadata[title]={
                   'title':title,'filename':filename,'size':len(data),'mime':ii.get('mime',''),
-                  'api_sha1_base36':api_h1,'local_sha1_hex':h1hex,'local_sha1_base36':h1b36,
+                  'api_sha1_hex':api_h1,'local_sha1_hex':h1hex,
                   'sha256':sha256,'license':lic,'artist':artist,'description':desc,
                   'source_url':ii['url'],'description_url':ii.get('descriptionurl',''),
               }
               rows.append('\t'.join(str(x).replace('\t',' ').replace('\n',' ') for x in [
-                  title,filename,len(data),ii.get('mime',''),api_h1,h1hex,h1b36,sha256,lic,artist,desc,ii['url']
+                  title,filename,len(data),ii.get('mime',''),api_h1,h1hex,sha256,lic,artist,desc,ii['url']
               ])+'\n')
           (prov/'COMMONS_ARAB_PERCUSSION_MANIFEST.tsv').write_text(''.join(rows),encoding='utf-8')
           (prov/'COMMONS_ARAB_PERCUSSION_METADATA.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
