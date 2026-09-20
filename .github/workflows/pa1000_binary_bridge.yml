@@ -18,69 +18,62 @@ jobs:
           set -euo pipefail
           mkdir -p artifact/media artifact/provenance
           python3 - <<'PY'
-          import urllib.parse, urllib.request, json, pathlib, hashlib, html, re
+          import urllib.parse, urllib.request, urllib.error, json, pathlib, hashlib, html, re, time
 
-          titles = [
-              'File:Riq demo2.wav',
-              'File:Mazhar demo.ogg',
-              'File:Davul demo.ogg',
-          ]
-          root = pathlib.Path('artifact')
-          media = root/'media'; prov = root/'provenance'
+          titles = ['File:Riq demo2.wav','File:Mazhar demo.ogg','File:Davul demo.ogg']
+          root = pathlib.Path('artifact'); media=root/'media'; prov=root/'provenance'
+          UA='AhmadAmerBakran-PA1000SourceAudit/1.0 (https://github.com/AhmadAmerBakran/GithubActions)'
 
-          def fetch(url):
-              req=urllib.request.Request(url,headers={'User-Agent':'PA1000-source-audit/1.0'})
-              with urllib.request.urlopen(req,timeout=120) as r:
-                  return r.read(), r.geturl()
+          def fetch(url, retries=5):
+              for attempt in range(retries):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
+                      with urllib.request.urlopen(req,timeout=180) as r:
+                          return r.read(),r.geturl()
+                  except urllib.error.HTTPError as e:
+                      if e.code not in (429,503) or attempt==retries-1: raise
+                      wait=int(e.headers.get('Retry-After') or (6*(attempt+1)))
+                      print(f'HTTP {e.code}; retrying in {wait}s: {url[:120]}')
+                      time.sleep(wait)
+              raise RuntimeError('unreachable')
+
+          qs=urllib.parse.urlencode({
+              'action':'query','format':'json','formatversion':'2','prop':'imageinfo',
+              'titles':'|'.join(titles),'iiprop':'url|size|sha1|mime|extmetadata','maxlag':'5'
+          })
+          api='https://commons.wikimedia.org/w/api.php?'+qs
+          raw,_=fetch(api)
+          obj=json.loads(raw.decode('utf-8'))
+          pages={p['title']:p for p in obj['query']['pages']}
 
           rows=['title\tfilename\tsize\tmime\tapi_sha1_hex\tlocal_sha1_hex\tsha256\tlicense\tartist\tdescription\tsource_url\n']
           metadata={}
-          for title in titles:
-              qs=urllib.parse.urlencode({
-                  'action':'query','format':'json','formatversion':'2',
-                  'prop':'imageinfo','titles':title,
-                  'iiprop':'url|size|sha1|mime|extmetadata'
-              })
-              api='https://commons.wikimedia.org/w/api.php?'+qs
-              raw,_=fetch(api)
-              obj=json.loads(raw.decode('utf-8'))
-              page=obj['query']['pages'][0]
-              if 'missing' in page:
-                  raise SystemExit(f'Missing Commons title: {title}')
-              ii=page['imageinfo'][0]
-              em=ii.get('extmetadata',{})
+          for idx,title in enumerate(titles):
+              page=pages.get(title)
+              if not page or 'missing' in page: raise SystemExit(f'Missing Commons title: {title}')
+              ii=page['imageinfo'][0]; em=ii.get('extmetadata',{})
               def emv(k): return html.unescape(re.sub('<[^>]+>',' ',em.get(k,{}).get('value',''))).replace('\t',' ').replace('\n',' ').strip()
-              lic=emv('LicenseShortName') or emv('License')
-              artist=emv('Artist')
-              desc=emv('ImageDescription')
+              lic=emv('LicenseShortName') or emv('License'); artist=emv('Artist'); desc=emv('ImageDescription')
               if not (lic.startswith('CC BY-SA 4.0') or lic.startswith('CC BY 4.0') or lic.startswith('CC0')):
                   raise SystemExit(f'Unexpected/non-approved license for {title}: {lic!r}')
+              if idx: time.sleep(8)
               data,final=fetch(ii['url'])
-              expected_size=int(ii['size'])
-              if len(data)!=expected_size:
-                  raise SystemExit(f'Size mismatch {title}: {len(data)} != {expected_size}')
-              h1hex=hashlib.sha1(data).hexdigest()
-              api_h1=ii['sha1'].lower()
-              if h1hex!=api_h1:
-                  raise SystemExit(f'SHA1 mismatch {title}: {h1hex} != {api_h1}')
-              sha256=hashlib.sha256(data).hexdigest()
-              filename=title.split(':',1)[1]
-              out=media/filename
-              out.write_bytes(data)
+              if len(data)!=int(ii['size']): raise SystemExit(f"Size mismatch {title}: {len(data)} != {ii['size']}")
+              h1hex=hashlib.sha1(data).hexdigest(); api_h1=ii['sha1'].lower()
+              if h1hex!=api_h1: raise SystemExit(f'SHA1 mismatch {title}: {h1hex} != {api_h1}')
+              sha256=hashlib.sha256(data).hexdigest(); filename=title.split(':',1)[1]
+              (media/filename).write_bytes(data)
               metadata[title]={
                   'title':title,'filename':filename,'size':len(data),'mime':ii.get('mime',''),
-                  'api_sha1_hex':api_h1,'local_sha1_hex':h1hex,
-                  'sha256':sha256,'license':lic,'artist':artist,'description':desc,
-                  'source_url':ii['url'],'description_url':ii.get('descriptionurl',''),
+                  'api_sha1_hex':api_h1,'local_sha1_hex':h1hex,'sha256':sha256,'license':lic,
+                  'artist':artist,'description':desc,'source_url':ii['url'],'description_url':ii.get('descriptionurl','')
               }
               rows.append('\t'.join(str(x).replace('\t',' ').replace('\n',' ') for x in [
                   title,filename,len(data),ii.get('mime',''),api_h1,h1hex,sha256,lic,artist,desc,ii['url']
               ])+'\n')
+              print('VERIFIED',filename,len(data),lic,sha256)
           (prov/'COMMONS_ARAB_PERCUSSION_MANIFEST.tsv').write_text(''.join(rows),encoding='utf-8')
           (prov/'COMMONS_ARAB_PERCUSSION_METADATA.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('Verified',len(metadata),'Commons originals')
-          for v in metadata.values():
-              print(v['filename'],v['size'],v['mime'],v['license'],v['sha256'])
           PY
 
       - name: Upload verified Commons Arab percussion originals
