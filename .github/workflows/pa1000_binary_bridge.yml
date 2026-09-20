@@ -1,4 +1,4 @@
-name: PA1000 High Value Freesound Source Probe
+name: PA1000 FSD50K Zurna Single File Bridge
 
 on:
   push:
@@ -9,122 +9,88 @@ permissions:
   contents: read
 
 jobs:
-  probe-high-value-sources:
+  fetch-zurna-derivative:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe Freesound public pages and FSD50K metadata
+      - name: Resolve one FSD50K derivative row without bulk dataset download
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifact/raw artifact/previews artifact/provenance artifact/fsd50k
+          mkdir -p artifact/audio artifact/provenance artifact/raw
           python3 - <<'PY'
-          import pathlib, re, urllib.request, urllib.error, html, hashlib, json, zipfile, io, csv, time
+          import urllib.request, urllib.parse, urllib.error, json, pathlib, hashlib, base64
 
-          targets = [
-              {'id':244152,'user':'Metzik','tag':'AS008_MAZHAR','expected':'Drum playing.wav'},
-              {'id':18661,'user':'cdrk','tag':'SRC08201_ZURNA','expected':'zurna_0001_[turkish]_4_shots_mono.flac'},
-          ]
-          root=pathlib.Path('artifact'); rawdir=root/'raw'; prevdir=root/'previews'; prov=root/'provenance'; fsddir=root/'fsd50k'
+          root=pathlib.Path('artifact'); aud=root/'audio'; prov=root/'provenance'; raw=root/'raw'
           UA='AhmadAmerBakran-PA1000SourceAudit/1.0 (https://github.com/AhmadAmerBakran/GithubActions)'
+          dataset='nguyenvulebinh/fsd50k'
+          target=18661
 
-          def fetch(url,retries=4,timeout=180):
-              last=None
-              for attempt in range(retries):
-                  try:
-                      req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
-                      with urllib.request.urlopen(req,timeout=timeout) as r:
-                          return r.read(),r.geturl(),getattr(r,'status',200),dict(r.headers)
-                  except urllib.error.HTTPError as e:
-                      last=e
-                      if e.code not in (429,503) or attempt==retries-1: raise
-                      wait=int(e.headers.get('Retry-After') or (5*(attempt+1)))
-                      time.sleep(wait)
-              raise last
+          def get(url,timeout=180):
+              req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'application/json,*/*'})
+              with urllib.request.urlopen(req,timeout=timeout) as r:
+                  return r.read(),r.geturl(),getattr(r,'status',200),dict(r.headers)
 
-          patterns=[
-              r'https?://[^"\'<> ]+(?:previews|preview)[^"\'<> ]+\.(?:ogg|mp3)',
-              r'https?://cdn\.freesound\.org/[^"\'<> ]+\.(?:ogg|mp3)',
-              r'https?://freesound\.org/data/previews/[^"\'<> ]+\.(?:ogg|mp3)',
-          ]
-          report=[]
-          for t in targets:
-              fsid=t['id']; user=t['user']; tag=t['tag']
-              page=f'https://freesound.org/people/{user}/sounds/{fsid}/'
-              data,final,status,headers=fetch(page,timeout=120)
-              text=data.decode('utf-8','replace')
-              (rawdir/f'{fsid}.html').write_text(text,encoding='utf-8')
-              urls=set()
-              for pat in patterns:
-                  urls.update(html.unescape(x) for x in re.findall(pat,text,re.I))
-              rows=[]
-              for i,purl in enumerate(sorted(urls),1):
-                  try:
-                      pdata,pfinal,pstatus,pheaders=fetch(purl,timeout=180)
-                      if pdata[:4]==b'OggS': ext='.ogg'
-                      elif pdata[:3]==b'ID3' or (len(pdata)>1 and pdata[0]==0xff and (pdata[1]&0xe0)==0xe0): ext='.mp3'
-                      else: ext='.bin'
-                      out=prevdir/f'{tag}_{fsid}_preview_{i:02d}{ext}'
-                      out.write_bytes(pdata)
-                      rows.append({'url':purl,'final_url':pfinal,'status':pstatus,'size':len(pdata),'sha256':hashlib.sha256(pdata).hexdigest(),'file':out.name})
-                  except Exception as e:
-                      rows.append({'url':purl,'error':f'{type(e).__name__}: {e}'})
-              probes={}
-              for label,url in {
-                  'api_v2':f'https://freesound.org/apiv2/sounds/{fsid}/',
-                  'download_page':f'https://freesound.org/people/{user}/sounds/{fsid}/download/{fsid}/',
-              }.items():
-                  try:
-                      d,f,s,h=fetch(url,retries=1,timeout=60)
-                      probes[label]={'status':s,'final_url':f,'size':len(d),'content_type':h.get('Content-Type','')}
-                  except urllib.error.HTTPError as e:
-                      probes[label]={'http_error':e.code,'location':e.headers.get('Location',''),'content_type':e.headers.get('Content-Type','')}
-                  except Exception as e:
-                      probes[label]={'error':f'{type(e).__name__}: {e}'}
-              item={'id':fsid,'user':user,'tag':tag,'expected_original':t['expected'],'page':page,'page_final':final,'page_status':status,'page_size':len(data),'preview_count':len(urls),'previews':rows,'endpoint_probes':probes}
-              report.append(item)
-              (prov/f'{tag}_{fsid}_probe.json').write_text(json.dumps(item,ensure_ascii=False,indent=2),encoding='utf-8')
-              print('FREESOUND',tag,fsid,'previews',len(urls))
+          dsq=urllib.parse.quote(dataset,safe='')
+          split_url=f'https://datasets-server.huggingface.co/splits?dataset={dsq}'
+          splits_blob,_,_,_=get(split_url)
+          (raw/'splits.json').write_bytes(splits_blob)
+          splits_obj=json.loads(splits_blob)
+          split_names=[]
+          for s in splits_obj.get('splits',[]):
+              if s.get('config')=='default': split_names.append(s.get('split'))
+          split_names=[x for x in split_names if x]
+          print('SPLITS',split_names)
 
-          # Official FSD50K small metadata/ground-truth only. Never download the large audio archives here.
-          zenodo='https://zenodo.org/records/4060432/files/'
-          archives={
-              'metadata':'FSD50K.metadata.zip?download=1',
-              'ground_truth':'FSD50K.ground_truth.zip?download=1',
-          }
-          fsd_matches={str(t['id']):{'id':t['id'],'metadata_matches':[],'ground_truth_matches':[]} for t in targets}
-          for kind,fn in archives.items():
+          attempts=[]; found=None
+          where=urllib.parse.quote('"fname"=18661',safe='')
+          for split in split_names:
+              url=f'https://datasets-server.huggingface.co/filter?dataset={dsq}&config=default&split={urllib.parse.quote(split,safe="")}&where={where}&offset=0&length=5'
               try:
-                  blob,final,status,headers=fetch(zenodo+fn,timeout=240)
-                  (fsddir/f'{kind}.sha256').write_text(hashlib.sha256(blob).hexdigest()+'\n',encoding='utf-8')
-                  z=zipfile.ZipFile(io.BytesIO(blob))
-                  for name in z.namelist():
-                      if name.endswith('/'):
-                          continue
-                      b=z.read(name)
-                      try: txt=b.decode('utf-8')
-                      except UnicodeDecodeError: continue
-                      for t in targets:
-                          sid=str(t['id'])
-                          if sid not in txt: continue
-                          hits=[]
-                          for line in txt.splitlines():
-                              if re.search(r'(?<!\d)'+re.escape(sid)+r'(?!\d)',line): hits.append(line[:2000])
-                          if hits:
-                              key='metadata_matches' if kind=='metadata' else 'ground_truth_matches'
-                              fsd_matches[sid][key].append({'archive_member':name,'lines':hits[:50]})
+                  blob,final,status,headers=get(url,timeout=180)
+                  (raw/f'filter_{split}.json').write_bytes(blob)
+                  obj=json.loads(blob)
+                  rows=obj.get('rows') or []
+                  attempts.append({'split':split,'status':status,'rows':len(rows),'url':url})
+                  if rows and found is None:
+                      found={'split':split,'payload':obj,'url':url}
               except Exception as e:
-                  (fsddir/f'{kind}.error.txt').write_text(f'{type(e).__name__}: {e}\n',encoding='utf-8')
-          for sid,obj in fsd_matches.items():
-              obj['present_any']=bool(obj['metadata_matches'] or obj['ground_truth_matches'])
-          (fsddir/'FSD50K_TARGET_MEMBERSHIP.json').write_text(json.dumps(fsd_matches,ensure_ascii=False,indent=2),encoding='utf-8')
-          (prov/'HIGH_VALUE_SOURCE_PROBE_SUMMARY.json').write_text(json.dumps({'targets':report,'fsd50k':fsd_matches,'guard':'FSD50K audio, if present, is dataset-derived 44.1kHz/16-bit mono and MUST NOT be called the Freesound original.'},ensure_ascii=False,indent=2),encoding='utf-8')
-          print(json.dumps(fsd_matches,indent=2))
+                  attempts.append({'split':split,'error':f'{type(e).__name__}: {e}','url':url})
+          if found is None:
+              (prov/'HF_FSD50K_18661_RESULT.json').write_text(json.dumps({'dataset':dataset,'target':target,'attempts':attempts,'found':False},indent=2),encoding='utf-8')
+              raise SystemExit('No filtered row for 18661')
+
+          rowwrap=found['payload']['rows'][0]
+          row=rowwrap.get('row',rowwrap)
+          mp3=row.get('mp3')
+          data=None; representation=type(mp3).__name__
+          if isinstance(mp3,list):
+              data=bytes((int(x)&255) for x in mp3)
+          elif isinstance(mp3,dict):
+              b=mp3.get('bytes')
+              if isinstance(b,list): data=bytes((int(x)&255) for x in b)
+              elif isinstance(b,str):
+                  try: data=base64.b64decode(b,validate=True)
+                  except Exception: pass
+              if data is None and mp3.get('path'):
+                  try: data,_,_,_=get(mp3['path'])
+                  except Exception: pass
+          elif isinstance(mp3,str):
+              try: data=base64.b64decode(mp3,validate=True)
+              except Exception: pass
+
+          result={'dataset':dataset,'target':target,'split':found['split'],'attempts':attempts,'row_index':rowwrap.get('row_idx'),'row_fields':{k:v for k,v in row.items() if k!='mp3'},'mp3_representation':representation,'found':True,'audio_extracted':data is not None}
+          if data is not None:
+              out=aud/'FSD50K_18661_dataset_derived.mp3'; out.write_bytes(data)
+              result.update({'audio_file':out.name,'audio_size':len(data),'audio_sha256':hashlib.sha256(data).hexdigest(),'magic_hex':data[:16].hex()})
+              print('AUDIO',len(data),result['audio_sha256'],result['magic_hex'])
+          (prov/'HF_FSD50K_18661_RESULT.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          (prov/'IDENTITY_GUARD.txt').write_text('This is a Hugging Face / FSD50K dataset-derived copy. It is NOT the Freesound original FLAC. Use for analysis/preflight only until original bytes are legally acquired and verified.\n',encoding='utf-8')
           PY
 
-      - name: Upload high-value source probe
+      - name: Upload one-file FSD50K Zurna bridge
         uses: actions/upload-artifact@v4
         with:
-          name: pa1000-high-value-freesound-probe-v088
+          name: pa1000-fsd50k-zurna-18661-derivative
           path: artifact
           if-no-files-found: error
           retention-days: 7
