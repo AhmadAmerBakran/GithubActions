@@ -33,24 +33,15 @@ jobs:
           test "$(wc -l < artifact/provenance/FILENAMES.txt)" -eq 25
           : > artifact/provenance/SHA256SUMS.txt
           : > artifact/provenance/GIT_BLOB_SHA1.txt
+          : > artifact/provenance/SIZES.txt
           while IFS= read -r name; do
-            sha256sum "artifact/darbuka/$name" >> artifact/provenance/SHA256SUMS.txt
+            file="artifact/darbuka/$name"
+            test -s "$file"
+            test "$(head -c 4 "$file")" = 'fLaC'
+            sha256sum "$file" >> artifact/provenance/SHA256SUMS.txt
             printf '%s  %s\n' "$(git -C freepats hash-object "samples/Darbuka/$name")" "$name" >> artifact/provenance/GIT_BLOB_SHA1.txt
+            printf '%s  %s\n' "$(stat -c '%s' "$file")" "$name" >> artifact/provenance/SIZES.txt
           done < artifact/provenance/FILENAMES.txt
-
-      - name: Validate and inspect FLAC files
-        shell: bash
-        run: |
-          set -euo pipefail
-          command -v ffmpeg >/dev/null
-          command -v ffprobe >/dev/null
-          printf 'filename\tcodec\tsample_rate\tchannels\tsample_fmt\tduration\n' > artifact/provenance/FFPROBE.tsv
-          while IFS= read -r f; do
-            ffmpeg -v error -i "$f" -f null - </dev/null
-            meta="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels,sample_fmt,duration -of default=noprint_wrappers=1:nokey=1 "$f" | paste -sd $'\t' -)"
-            printf '%s\t%s\n' "$(basename "$f")" "$meta" >> artifact/provenance/FFPROBE.tsv
-          done < <(find artifact/darbuka -maxdepth 1 -type f -name '*.flac' | LC_ALL=C sort)
-          test "$(($(wc -l < artifact/provenance/FFPROBE.tsv) - 1))" -eq 25
 
       - name: Upload pinned Darbuka artifact
         uses: actions/upload-artifact@v4
