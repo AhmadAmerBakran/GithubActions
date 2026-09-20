@@ -1,4 +1,4 @@
-name: PA1000 FreePats Binary Bridge
+name: PA1000 Commons Binary Bridge
 
 on:
   push:
@@ -9,44 +9,69 @@ permissions:
   contents: read
 
 jobs:
-  fetch-pinned-darbuka:
+  fetch-commons-candidates:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch pinned FreePats repository
+      - name: Fetch and verify Wikimedia Commons originals
         shell: bash
         run: |
           set -euo pipefail
-          git clone --filter=blob:none https://github.com/freepats/world-percussion.git freepats
-          cd freepats
-          git checkout e54eb2912a0d6d4444ab205d52f778e27da0fc96
-          test "$(git rev-parse HEAD)" = "e54eb2912a0d6d4444ab205d52f778e27da0fc96"
+          mkdir -p artifact/media artifact/provenance
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import urllib.request
 
-      - name: Collect Darbuka sources and provenance
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifact/darbuka artifact/provenance
-          cp freepats/samples/Darbuka/*.flac artifact/darbuka/
-          cp "freepats/WorldPercussion 20200905.sfz" artifact/provenance/
-          printf '%s\n' 'e54eb2912a0d6d4444ab205d52f778e27da0fc96' > artifact/provenance/SOURCE_COMMIT.txt
-          find artifact/darbuka -maxdepth 1 -type f -name '*.flac' -printf '%f\n' | LC_ALL=C sort > artifact/provenance/FILENAMES.txt
-          test "$(wc -l < artifact/provenance/FILENAMES.txt)" -eq 25
-          : > artifact/provenance/SHA256SUMS.txt
-          : > artifact/provenance/GIT_BLOB_SHA1.txt
-          : > artifact/provenance/SIZES.txt
-          while IFS= read -r name; do
-            file="artifact/darbuka/$name"
-            test -s "$file"
-            test "$(head -c 4 "$file")" = 'fLaC'
-            sha256sum "$file" >> artifact/provenance/SHA256SUMS.txt
-            printf '%s  %s\n' "$(git -C freepats hash-object "samples/Darbuka/$name")" "$name" >> artifact/provenance/GIT_BLOB_SHA1.txt
-            printf '%s  %s\n' "$(stat -c '%s' "$file")" "$name" >> artifact/provenance/SIZES.txt
-          done < artifact/provenance/FILENAMES.txt
+          items = [
+              {
+                  "name": "Abu_Hawash_Live_in_Izraa.webm",
+                  "url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Abu_Hawash_Live_in_Izraa%27.webm",
+                  "size": 24081580,
+                  "sha1": "439f1c94e5cfa7d89682ed0810e8b713d0b56590",
+                  "license": "CC BY 3.0",
+                  "identity": "Southern Syria electro-mijwiz techno dabke live performance, Izraa, Syria, 2010",
+                  "source_page": "https://commons.wikimedia.org/wiki/File:Abu_Hawash_Live_in_Izraa%27.webm",
+              },
+              {
+                  "name": "Dawoola_and_Zurna_Live.ogg",
+                  "url": "https://commons.wikimedia.org/wiki/Special:Redirect/file/Dawoola_and_Zurna_Live.ogg",
+                  "size": 3788368,
+                  "sha1": "8e5396f58b4cfab444ba3109f5071cbdd3886881",
+                  "license": "CC BY-SA 3.0 / GFDL; project will use CC BY-SA 3.0 route",
+                  "identity": "Live Zurna + Dawoola wedding performance; uploader original",
+                  "source_page": "https://commons.wikimedia.org/wiki/File:Dawoola_and_Zurna_Live.ogg",
+              },
+          ]
 
-      - name: Upload pinned Darbuka artifact
+          media = pathlib.Path("artifact/media")
+          prov = pathlib.Path("artifact/provenance")
+          rows = ["filename\tsize\tsha1\tsha256\tlicense\tidentity\tsource_page\n"]
+          for item in items:
+              req = urllib.request.Request(item["url"], headers={"User-Agent": "PA1000-source-audit/1.0"})
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  data = r.read()
+              got_size = len(data)
+              got_sha1 = hashlib.sha1(data).hexdigest()
+              got_sha256 = hashlib.sha256(data).hexdigest()
+              if got_size != item["size"]:
+                  raise SystemExit(f"size mismatch {item['name']}: {got_size} != {item['size']}")
+              if got_sha1 != item["sha1"]:
+                  raise SystemExit(f"sha1 mismatch {item['name']}: {got_sha1} != {item['sha1']}")
+              (media / item["name"]).write_bytes(data)
+              rows.append("\t".join([
+                  item["name"], str(got_size), got_sha1, got_sha256,
+                  item["license"], item["identity"], item["source_page"],
+              ]) + "\n")
+          (prov / "COMMONS_SOURCE_MANIFEST.tsv").write_text("".join(rows), encoding="utf-8")
+          PY
+
+          test "$(find artifact/media -maxdepth 1 -type f | wc -l)" -eq 2
+          test -s artifact/provenance/COMMONS_SOURCE_MANIFEST.tsv
+
+      - name: Upload Commons source artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pa1000-freepats-darbuka-e54eb291
+          name: pa1000-commons-source-candidates
           path: artifact
           if-no-files-found: error
           retention-days: 7
