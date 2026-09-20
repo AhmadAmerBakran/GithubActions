@@ -38,13 +38,19 @@ jobs:
             printf '%s  %s\n' "$(git -C freepats hash-object "samples/Darbuka/$name")" "$name" >> artifact/provenance/GIT_BLOB_SHA1.txt
           done < artifact/provenance/FILENAMES.txt
 
-      - name: Validate FLAC files
+      - name: Validate and inspect FLAC files
         shell: bash
         run: |
           set -euo pipefail
+          command -v ffmpeg >/dev/null
+          command -v ffprobe >/dev/null
+          printf 'filename\tcodec\tsample_rate\tchannels\tsample_fmt\tduration\n' > artifact/provenance/FFPROBE.tsv
           while IFS= read -r f; do
-            flac -t "$f"
+            ffmpeg -v error -i "$f" -f null - </dev/null
+            meta="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels,sample_fmt,duration -of default=noprint_wrappers=1:nokey=1 "$f" | paste -sd $'\t' -)"
+            printf '%s\t%s\n' "$(basename "$f")" "$meta" >> artifact/provenance/FFPROBE.tsv
           done < <(find artifact/darbuka -maxdepth 1 -type f -name '*.flac' | LC_ALL=C sort)
+          test "$(($(wc -l < artifact/provenance/FFPROBE.tsv) - 1))" -eq 25
 
       - name: Upload pinned Darbuka artifact
         uses: actions/upload-artifact@v4
