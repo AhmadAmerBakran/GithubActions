@@ -1,4 +1,4 @@
-name: PA1000 Commons Riq Mazhar Tabl Bridge
+name: PA1000 High Value Freesound Source Probe
 
 on:
   push:
@@ -9,77 +9,122 @@ permissions:
   contents: read
 
 jobs:
-  fetch-commons-arab-percussion:
+  probe-high-value-sources:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve Commons originals through MediaWiki API and verify bytes
+      - name: Probe Freesound public pages and FSD50K metadata
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifact/media artifact/provenance
+          mkdir -p artifact/raw artifact/previews artifact/provenance artifact/fsd50k
           python3 - <<'PY'
-          import urllib.parse, urllib.request, urllib.error, json, pathlib, hashlib, html, re, time
+          import pathlib, re, urllib.request, urllib.error, html, hashlib, json, zipfile, io, csv, time
 
-          titles = ['File:Riq demo2.wav','File:Mazhar demo.ogg','File:Davul demo.ogg']
-          root = pathlib.Path('artifact'); media=root/'media'; prov=root/'provenance'
+          targets = [
+              {'id':244152,'user':'Metzik','tag':'AS008_MAZHAR','expected':'Drum playing.wav'},
+              {'id':18661,'user':'cdrk','tag':'SRC08201_ZURNA','expected':'zurna_0001_[turkish]_4_shots_mono.flac'},
+          ]
+          root=pathlib.Path('artifact'); rawdir=root/'raw'; prevdir=root/'previews'; prov=root/'provenance'; fsddir=root/'fsd50k'
           UA='AhmadAmerBakran-PA1000SourceAudit/1.0 (https://github.com/AhmadAmerBakran/GithubActions)'
 
-          def fetch(url, retries=5):
+          def fetch(url,retries=4,timeout=180):
+              last=None
               for attempt in range(retries):
                   try:
                       req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
-                      with urllib.request.urlopen(req,timeout=180) as r:
-                          return r.read(),r.geturl()
+                      with urllib.request.urlopen(req,timeout=timeout) as r:
+                          return r.read(),r.geturl(),getattr(r,'status',200),dict(r.headers)
                   except urllib.error.HTTPError as e:
+                      last=e
                       if e.code not in (429,503) or attempt==retries-1: raise
-                      wait=int(e.headers.get('Retry-After') or (6*(attempt+1)))
-                      print(f'HTTP {e.code}; retrying in {wait}s: {url[:120]}')
+                      wait=int(e.headers.get('Retry-After') or (5*(attempt+1)))
                       time.sleep(wait)
-              raise RuntimeError('unreachable')
+              raise last
 
-          qs=urllib.parse.urlencode({
-              'action':'query','format':'json','formatversion':'2','prop':'imageinfo',
-              'titles':'|'.join(titles),'iiprop':'url|size|sha1|mime|extmetadata','maxlag':'5'
-          })
-          api='https://commons.wikimedia.org/w/api.php?'+qs
-          raw,_=fetch(api)
-          obj=json.loads(raw.decode('utf-8'))
-          pages={p['title']:p for p in obj['query']['pages']}
+          patterns=[
+              r'https?://[^"\'<> ]+(?:previews|preview)[^"\'<> ]+\.(?:ogg|mp3)',
+              r'https?://cdn\.freesound\.org/[^"\'<> ]+\.(?:ogg|mp3)',
+              r'https?://freesound\.org/data/previews/[^"\'<> ]+\.(?:ogg|mp3)',
+          ]
+          report=[]
+          for t in targets:
+              fsid=t['id']; user=t['user']; tag=t['tag']
+              page=f'https://freesound.org/people/{user}/sounds/{fsid}/'
+              data,final,status,headers=fetch(page,timeout=120)
+              text=data.decode('utf-8','replace')
+              (rawdir/f'{fsid}.html').write_text(text,encoding='utf-8')
+              urls=set()
+              for pat in patterns:
+                  urls.update(html.unescape(x) for x in re.findall(pat,text,re.I))
+              rows=[]
+              for i,purl in enumerate(sorted(urls),1):
+                  try:
+                      pdata,pfinal,pstatus,pheaders=fetch(purl,timeout=180)
+                      if pdata[:4]==b'OggS': ext='.ogg'
+                      elif pdata[:3]==b'ID3' or (len(pdata)>1 and pdata[0]==0xff and (pdata[1]&0xe0)==0xe0): ext='.mp3'
+                      else: ext='.bin'
+                      out=prevdir/f'{tag}_{fsid}_preview_{i:02d}{ext}'
+                      out.write_bytes(pdata)
+                      rows.append({'url':purl,'final_url':pfinal,'status':pstatus,'size':len(pdata),'sha256':hashlib.sha256(pdata).hexdigest(),'file':out.name})
+                  except Exception as e:
+                      rows.append({'url':purl,'error':f'{type(e).__name__}: {e}'})
+              probes={}
+              for label,url in {
+                  'api_v2':f'https://freesound.org/apiv2/sounds/{fsid}/',
+                  'download_page':f'https://freesound.org/people/{user}/sounds/{fsid}/download/{fsid}/',
+              }.items():
+                  try:
+                      d,f,s,h=fetch(url,retries=1,timeout=60)
+                      probes[label]={'status':s,'final_url':f,'size':len(d),'content_type':h.get('Content-Type','')}
+                  except urllib.error.HTTPError as e:
+                      probes[label]={'http_error':e.code,'location':e.headers.get('Location',''),'content_type':e.headers.get('Content-Type','')}
+                  except Exception as e:
+                      probes[label]={'error':f'{type(e).__name__}: {e}'}
+              item={'id':fsid,'user':user,'tag':tag,'expected_original':t['expected'],'page':page,'page_final':final,'page_status':status,'page_size':len(data),'preview_count':len(urls),'previews':rows,'endpoint_probes':probes}
+              report.append(item)
+              (prov/f'{tag}_{fsid}_probe.json').write_text(json.dumps(item,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('FREESOUND',tag,fsid,'previews',len(urls))
 
-          rows=['title\tfilename\tsize\tmime\tapi_sha1_hex\tlocal_sha1_hex\tsha256\tlicense\tartist\tdescription\tsource_url\n']
-          metadata={}
-          for idx,title in enumerate(titles):
-              page=pages.get(title)
-              if not page or 'missing' in page: raise SystemExit(f'Missing Commons title: {title}')
-              ii=page['imageinfo'][0]; em=ii.get('extmetadata',{})
-              def emv(k): return html.unescape(re.sub('<[^>]+>',' ',em.get(k,{}).get('value',''))).replace('\t',' ').replace('\n',' ').strip()
-              lic=emv('LicenseShortName') or emv('License'); artist=emv('Artist'); desc=emv('ImageDescription')
-              if not (lic.startswith('CC BY-SA 4.0') or lic.startswith('CC BY 4.0') or lic.startswith('CC0')):
-                  raise SystemExit(f'Unexpected/non-approved license for {title}: {lic!r}')
-              if idx: time.sleep(8)
-              data,final=fetch(ii['url'])
-              if len(data)!=int(ii['size']): raise SystemExit(f"Size mismatch {title}: {len(data)} != {ii['size']}")
-              h1hex=hashlib.sha1(data).hexdigest(); api_h1=ii['sha1'].lower()
-              if h1hex!=api_h1: raise SystemExit(f'SHA1 mismatch {title}: {h1hex} != {api_h1}')
-              sha256=hashlib.sha256(data).hexdigest(); filename=title.split(':',1)[1]
-              (media/filename).write_bytes(data)
-              metadata[title]={
-                  'title':title,'filename':filename,'size':len(data),'mime':ii.get('mime',''),
-                  'api_sha1_hex':api_h1,'local_sha1_hex':h1hex,'sha256':sha256,'license':lic,
-                  'artist':artist,'description':desc,'source_url':ii['url'],'description_url':ii.get('descriptionurl','')
-              }
-              rows.append('\t'.join(str(x).replace('\t',' ').replace('\n',' ') for x in [
-                  title,filename,len(data),ii.get('mime',''),api_h1,h1hex,sha256,lic,artist,desc,ii['url']
-              ])+'\n')
-              print('VERIFIED',filename,len(data),lic,sha256)
-          (prov/'COMMONS_ARAB_PERCUSSION_MANIFEST.tsv').write_text(''.join(rows),encoding='utf-8')
-          (prov/'COMMONS_ARAB_PERCUSSION_METADATA.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
+          # Official FSD50K small metadata/ground-truth only. Never download the large audio archives here.
+          zenodo='https://zenodo.org/records/4060432/files/'
+          archives={
+              'metadata':'FSD50K.metadata.zip?download=1',
+              'ground_truth':'FSD50K.ground_truth.zip?download=1',
+          }
+          fsd_matches={str(t['id']):{'id':t['id'],'metadata_matches':[],'ground_truth_matches':[]} for t in targets}
+          for kind,fn in archives.items():
+              try:
+                  blob,final,status,headers=fetch(zenodo+fn,timeout=240)
+                  (fsddir/f'{kind}.sha256').write_text(hashlib.sha256(blob).hexdigest()+'\n',encoding='utf-8')
+                  z=zipfile.ZipFile(io.BytesIO(blob))
+                  for name in z.namelist():
+                      if name.endswith('/'):
+                          continue
+                      b=z.read(name)
+                      try: txt=b.decode('utf-8')
+                      except UnicodeDecodeError: continue
+                      for t in targets:
+                          sid=str(t['id'])
+                          if sid not in txt: continue
+                          hits=[]
+                          for line in txt.splitlines():
+                              if re.search(r'(?<!\d)'+re.escape(sid)+r'(?!\d)',line): hits.append(line[:2000])
+                          if hits:
+                              key='metadata_matches' if kind=='metadata' else 'ground_truth_matches'
+                              fsd_matches[sid][key].append({'archive_member':name,'lines':hits[:50]})
+              except Exception as e:
+                  (fsddir/f'{kind}.error.txt').write_text(f'{type(e).__name__}: {e}\n',encoding='utf-8')
+          for sid,obj in fsd_matches.items():
+              obj['present_any']=bool(obj['metadata_matches'] or obj['ground_truth_matches'])
+          (fsddir/'FSD50K_TARGET_MEMBERSHIP.json').write_text(json.dumps(fsd_matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          (prov/'HIGH_VALUE_SOURCE_PROBE_SUMMARY.json').write_text(json.dumps({'targets':report,'fsd50k':fsd_matches,'guard':'FSD50K audio, if present, is dataset-derived 44.1kHz/16-bit mono and MUST NOT be called the Freesound original.'},ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(fsd_matches,indent=2))
           PY
 
-      - name: Upload verified Commons Arab percussion originals
+      - name: Upload high-value source probe
         uses: actions/upload-artifact@v4
         with:
-          name: pa1000-commons-riq-mazhar-tabl
+          name: pa1000-high-value-freesound-probe-v088
           path: artifact
           if-no-files-found: error
           retention-days: 7
